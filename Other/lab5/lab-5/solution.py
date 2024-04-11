@@ -1,10 +1,10 @@
-import requests
-from pydantic import BaseModel
 from base64 import b64decode
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+import requests
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from pydantic import BaseModel
 
 
 class Ciphertext(BaseModel):
@@ -17,25 +17,37 @@ class Challenge(BaseModel):
     ciphertext: str
 
 
-def xor_cipher(key: bytes, input: bytes) -> bytes:
-    """Encrypts plaintext using XOR cipher with the provided key."""
-    output = bytes(a ^ b for a, b in zip(key, input))
-    return output
-
-
-def derive_key(key_seed: str) -> bytes:
-    """Derives encryption/decryption key from the given key_seed.
-    Uses modern key derivation function (KDF) scrypt.
-    """
-    kdf = Scrypt(
-        salt=b'',
-        length=32,
-        n=2**14,
-        r=8,
-        p=1,
+def get_access_token(username, password, url):
+    response = requests.post(
+        url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={"username": username, "password": password},
     )
-    key = kdf.derive(key_seed.encode())
-    return key
+    response.raise_for_status()
+    return response.json().get("access_token")
+
+
+def encrypt_chosen_plaintext(plaintext: str, token: str, url: str) -> str:
+    response = requests.post(
+        url=url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"plaintext": plaintext},
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+
+def get_challenge(url):
+    response = requests.get(
+        url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def decrypt_challenge(key: bytes, challenge: Challenge) -> str:
@@ -56,41 +68,39 @@ def decrypt_challenge(key: bytes, challenge: Challenge) -> str:
     return plaintext.decode()
 
 
-def get_challenge(url):
+def derive_key(key_seed: str, key_length=32) -> bytes:
+    """Derives encryption/decryption key from the given key_seed.
+    Uses modern key derivation function (KDF) scrypt.
+    """
+    kdf = Scrypt(
+        salt=b"",
+        length=key_length,
+        n=2**14,
+        r=8,
+        p=1,
+    )
+    key = kdf.derive(key_seed.encode())
+    return key
+
+
+def get_wordlist(url):
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.content
+
+
+def get_encrypted_cookie(url):
     response = requests.get(url)
     response.raise_for_status()
     return response.json()
 
 
-def get_token(url, username, password):
-    response = requests.post(
-        url=url,
-        headers={
-            "accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
-        data={
-            "username": username,
-            "password": password
-        }
+def get_current_iv(url, token):
+    response = encrypt_chosen_plaintext(
+        plaintext=b"ff".hex(), token=token, url=url
     )
-    response.raise_for_status()
-    token = response.json().get("access_token")
-    return token
-
-
-def encrypt_chosen_plaintext(url, token, plaintext):
-    response = requests.post(
-        url=url,
-        headers={
-            "accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        },
-        json={"plaintext": plaintext}
-    )
-    response.raise_for_status()
-    return response.json()
+    iv = response.get("iv")
+    return iv
 
 
 def add_padding(word: bytes) -> int:
@@ -108,44 +118,29 @@ def test_padding():
         print(f"padded_word: {padded_word.hex()}\n")
 
 
-def get_wordlist(url):
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.content
+if __name__ == "__main__":
+    host = "10.0.15.10"
+    username = "stankovic_mateo"
+    password = "bityconter"
 
-
-def get_encrypted_cookie(url):
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
-
-
-def get_current_iv(url, token):
-    response = encrypt_chosen_plaintext(
-        url=url, token=token, plaintext=b"dummy".hex())
-    return response.get("iv")
-
-
-if __name__ == '__main__':
-    host = "10.0.15.6"
-    username = "celan_dea"
-
-    # get the token
+    # Get the token
     path = "cbc/token"
     url = f"http://{host}/{path}"
-    password = "froneporan"
 
-    token = get_token(url, username, password)
+    # Step 1: Get the token
+    token = get_access_token(username, password, url)
     print(f"Token: {token}")
 
-    # Get the wordlist
+    # Step 2: Get the wordlist
     path = "static/wordlist.txt"
     url = f"http://{host}/{path}"
+
     wordlist = get_wordlist(url)
 
-    # Get the encrypted cookie and its IV
+    # Step 3: Get the encrypted cookie and its IV
     path = "cbc/iv/encrypted_cookie"
     url = f"http://{host}/{path}"
+    
     response = get_encrypted_cookie(url)
     ciphertext = Ciphertext(**response)
     cookie_iv = b64decode(ciphertext.iv)
@@ -154,48 +149,67 @@ if __name__ == '__main__':
     cookie_iv = int.from_bytes(cookie_iv, byteorder="big")
     print(f"Cookie IV: {cookie_iv}")
 
-    # Get current IV
-    path = "cbc/iv/"
+    # Step 4: Get/learn the current IV
+    path = "cbc/iv"
     url = f"http://{host}/{path}"
-    current_iv = get_current_iv(url, token)
-    current_iv = b64decode(current_iv)
+
+    iv = get_current_iv(url, token)
+    current_iv = b64decode(iv)
+
     current_iv = int.from_bytes(current_iv, byteorder="big")
     print(f"Current IV: {current_iv}")
 
-    # Prepare chosen plaintext and start CPA
+    # Step 5: Start the chosen-plaintext attack
     cookie = ""
     for word in wordlist.split():
         print(f"\nTesting word: {word}")
+        
+        # 5.1 Calculate the IV for the next word
         next_iv = current_iv + 4
 
+        # 5.2 Pad the candidate word
         padded_word = add_padding(word)
         print(f"Padded word: {padded_word.hex()}")
         padded_word = int.from_bytes(padded_word, byteorder="big")
 
+        # 5.3 Prepare chosen plaintext (hex encoded)
         chosen_plaintext = padded_word ^ cookie_iv ^ next_iv
         chosen_plaintext = chosen_plaintext.to_bytes(16, "big").hex()
+        print(f"[*] Plaintext: {chosen_plaintext}") 
+
+        # 5.4 Send the chosen plaintext to the server
         response = encrypt_chosen_plaintext(
-            url=url, token=token, plaintext=chosen_plaintext
+            plaintext=chosen_plaintext,
+            token=token,
+            url=url,
         )
+        
         ciphertext = Ciphertext(**response)
         iv = b64decode(ciphertext.iv)
-        ciphertext = b64decode(ciphertext.ciphertext)
-
+        ciphertext = b64decode(ciphertext.ciphertext)        
+        
+        # 5.5 Verify if the candidate word matches the encrypted cookie
         if ciphertext[:16] == cookie_ciphertext[:16]:
             cookie = word.decode()
-            print(f">>>>>>> Cookie: {cookie}")
-            break
-        current_iv = int.from_bytes(iv, byteorder="big")
+            print(f"Cookie: \t{cookie}")
+           # break
 
-    # Get the challenge
+
+        # 5.6 Update the current IV
+        current_iv = int.from_bytes(iv, byteorder="big")
+        print(f"[*] Current IV: {current_iv}")
+
+        
+    # Step 6: Derive the key from the cookie
+    key = derive_key(key_seed=cookie)
+
+    # Step 7: Get the challenge
     path = "cbc/iv/challenge"
     url = f"http://{host}/{path}"
+
     response = get_challenge(url)
     challenge = Challenge(**response)
-
-    # derive the decryption key
-    key = derive_key(cookie)
-
-    # decrypt the challenge
+    
+    # Step 8: Decrypt the challenge
     plaintext = decrypt_challenge(key, challenge)
-    print(f"Decrypted challenge: {plaintext}")
+    print(f"\nDecrypted challenge: {plaintext}")
